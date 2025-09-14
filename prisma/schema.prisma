@@ -1,0 +1,43 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// Stores information about each repository where the GitHub App is installed.
+model Repository {
+  id              Int      @id @default(autoincrement())
+  githubRepoId    BigInt   @unique // Using BigInt for GitHub's large IDs
+  name            String // e.g., "my-org/my-awesome-project"
+  installationId  BigInt   @unique // The ID for the app's installation on this repo
+  isActive        Boolean  @default(true) // To handle uninstalls
+  reviews         Review[] // Relation to all reviews for this repository
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+}
+
+// Single review process for a pull request.
+model Review {
+  id                Int      @id @default(autoincrement())
+  pullRequestNumber Int
+  pullRequestId     BigInt   @unique
+  status            Status   @default(PENDING) // PENDING, PROCESSING, COMPLETED, FAILED
+  result            Json? // Stores the final JSON output from the LLM
+  commitSha         String // The SHA of the head commit that was reviewed
+  repository        Repository @relation(fields: [repositoryId], references: [id])
+  repositoryId      Int
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  @@index([repositoryId])
+}
+
+enum Status {
+  PENDING
+  PROCESSING
+  COMPLETED
+  FAILED
+}
