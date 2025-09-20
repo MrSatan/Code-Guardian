@@ -14,4 +14,7 @@ export default () => ({
   openai: {
     apiKey: process.env.OPENAI_API_KEY,
   },
+  google: {
+    apiKey: process.env.GOOGLE_API_KEY,
+  },
 });

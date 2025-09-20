@@ -1,36 +1,201 @@
+import { Injectable, Logger } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
+import { App } from 'octokit';
+import { VCS } from '../vcs.interface';
+import { PrismaService } from '../../database/prisma.service';
 import { InjectQueue } from '@nestjs/bullmq';
-import { Injectable } from '@nestjs/common';
 import { Queue } from 'bullmq';
-import { VersionControlService, VcsProvider } from '../vcs.interface';
 
 @Injectable()
-export class GithubService implements VersionControlService {
-  readonly provider = VcsProvider.GitHub;
+export class GithubService implements VCS {
+  private readonly logger = new Logger(GithubService.name);
+  private readonly app: App;
 
-  constructor(@InjectQueue('code-review') private readonly codeReviewQueue: Queue) {}
+  constructor(
+    private readonly configService: ConfigService,
+    private readonly prisma: PrismaService,
+    @InjectQueue('code-review') private readonly codeReviewQueue: Queue,
+  ) {
+    const appId = this.configService.get<string>('GITHUB_APP_ID');
+    const privateKey = this.configService.get<string>('GITHUB_PRIVATE_KEY');
+
+    if (!appId || !privateKey) {
+      throw new Error('GitHub App ID and Private Key must be configured.');
+    }
+
+    this.app = new App({
+      appId,
+      privateKey: privateKey.replace(/\\n/g, '\n'),
+    });
+  }
+
+  async getPullRequestDiff(
+    installationId: number,
+    owner: string,
+    repo: string,
+    pullNumber: number,
+  ): Promise<string> {
+    this.logger.log(
+      `Fetching diff for PR #${pullNumber} in ${owner}/${repo} (installation ${installationId})`,
+    );
+
+    try {
+      const octokit = await this.app.getInstallationOctokit(installationId);
+
+      const response = await octokit.request(
+        'GET /repos/{owner}/{repo}/pulls/{pull_number}',
+        {
+          owner,
+          repo,
+          pull_number: pullNumber,
+          headers: {
+            accept: 'application/vnd.github.v3.diff',
+          },
+        },
+      );
+
+      return response.data as unknown as string;
+    } catch (error) {
+      this.logger.error(
+        `Failed to fetch diff for PR #${pullNumber} in ${owner}/${repo}`,
+        error.stack,
+      );
+      throw new Error('Could not fetch pull request diff from GitHub.');
+    }
+  }
+
+  async postReviewComment(
+    installationId: number,
+    owner: string,
+    repo: string,
+    pullNumber: number,
+    comment: string,
+    file: string,
+    lineNumber: number,
+    commitId: string,
+  ): Promise<void> {
+    this.logger.log(
+      `Posting comment to PR #${pullNumber} in ${owner}/${repo} on ${file}:${lineNumber}`,
+    );
+
+    try {
+      const octokit = await this.app.getInstallationOctokit(installationId);
+
+      await octokit.request(
+        'POST /repos/{owner}/{repo}/pulls/{pull_number}/comments',
+        {
+          owner,
+          repo,
+          pull_number: pullNumber,
+          body: comment,
+          path: file,
+          line: lineNumber,
+          commit_id: commitId,
+        },
+      );
+    } catch (error) {
+      this.logger.error(
+        `Failed to post comment to PR #${pullNumber} in ${owner}/${repo}`,
+        error.stack,
+      );
+      throw new Error('Could not post comment to GitHub.');
+    }
+  }
+
+  async getFileContent(
+    installationId: number,
+    owner: string,
+    repo: string,
+    path: string,
+    commitId: string,
+  ): Promise<string | null> {
+    this.logger.log(
+      `Fetching content of ${path} in ${owner}/${repo} at commit ${commitId}`,
+    );
+
+    try {
+      const octokit = await this.app.getInstallationOctokit(installationId);
+
+      const response = await octokit.request(
+        'GET /repos/{owner}/{repo}/contents/{path}',
+        {
+          owner,
+          repo,
+          path,
+          ref: commitId,
+        },
+      );
+
+      if ('content' in response.data) {
+        return Buffer.from(response.data.content, 'base64').toString('utf-8');
+      }
+
+      return null;
+    } catch (error) {
+      if (error.status === 404) {
+        this.logger.warn(
+          `File not found: ${path} in ${owner}/${repo} at commit ${commitId}`,
+        );
+        return null;
+      }
+
+      this.logger.error(
+        `Failed to fetch content of ${path} in ${owner}/${repo}`,
+        error.stack,
+      );
+      throw new Error('Could not fetch file content from GitHub.');
+    }
+  }
 
   async handlePullRequestEvent(payload: any): Promise<void> {
-    const { action, pull_request, installation } = payload;
-
-    if (action !== 'opened' && action !== 'synchronize') {
+    if (payload.action !== 'opened' && payload.action !== 'synchronize') {
+      this.logger.log(
+        `Ignoring pull request event with action: ${payload.action}`,
+      );
       return;
     }
 
-    const jobPayload = {
+    const { pull_request, repository, installation } = payload;
+
+    const job = {
       installationId: installation.id,
-      owner: pull_request.head.repo.owner.login,
-      repo: pull_request.head.repo.name,
-      pull_number: pull_request.number,
-      commit_sha: pull_request.head.sha,
-      provider: this.provider,
+      owner: repository.owner.login,
+      repo: repository.name,
+      pullNumber: pull_request.number,
+      pullRequestId: pull_request.id,
+      commitSha: pull_request.head.sha,
     };
 
-    await this.codeReviewQueue.add('code-review', jobPayload);
+    await this.codeReviewQueue.add('code-review', job);
+    this.logger.log(`Added job to code-review queue: ${JSON.stringify(job)}`);
   }
 
   async handleInstallationEvent(payload: any): Promise<void> {
-    // This is where you would handle the app installation event.
-    // For now, we'll just log it.
-    console.log('Installation event received:', payload);
+    const { action, installation, repositories } = payload;
+
+    if (action === 'created') {
+      for (const repo of repositories) {
+        await this.prisma.repository.create({
+          data: {
+            githubRepoId: repo.id,
+            name: repo.full_name,
+            installationId: installation.id,
+          },
+        });
+        this.logger.log(`Installed on repository: ${repo.full_name}`);
+      }
+    } else if (action === 'deleted') {
+      await this.prisma.repository.update({
+        where: {
+          installationId: installation.id,
+        },
+        data: {
+          isActive: false,
+        },
+      });
+      this.logger.log(`Uninstalled from repository`);
+    } else {
+      this.logger.log(`Ignoring installation event with action: ${action}`);
+    }
   }
 }
