@@ -4,6 +4,7 @@ import { VcsController } from './vcs.controller';
 import { GithubService } from './github/github.service';
 import { QueueModule } from 'src/queue/queue.module';
 
+console.log('test');
 @Module({
   imports: [
     QueueModule,
