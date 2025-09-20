@@ -5,7 +5,9 @@ import { AppService } from './app.service';
 import configuration from './config/configuration';
 import { PrismaModule } from './database/prisma.module';
 import { QueueModule } from './queue/queue.module';
-import { VcsModule } from './vcs/vcs.module';
+import { VCSModule } from './vcs/vcs.module';
+import { ReviewModule } from './review/review.module';
+import { AIModule } from './ai/ai.module';
 
 @Module({
   imports: [
@@ -15,7 +17,9 @@ import { VcsModule } from './vcs/vcs.module';
     }),
     PrismaModule,
     QueueModule,
-    VcsModule,
+    VCSModule,
+    ReviewModule,
+    AIModule,
   ],
   controllers: [AppController],
   providers: [AppService],

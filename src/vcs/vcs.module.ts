@@ -1,17 +1,11 @@
-import { Module } from '@nestjs/common';
-import { BullModule } from '@nestjs/bullmq';
+import { Module, NestModule, MiddlewareConsumer } from '@nestjs/common';
+import { ConfigModule } from '@nestjs/config';
+import { GithubMiddleware } from './github/github.middleware';
+import { GithubModule } from './github/github.module';
 import { VcsController } from './vcs.controller';
-import { GithubService } from './github/github.service';
-import { QueueModule } from 'src/queue/queue.module';
 
 @Module({
-  imports: [
-    QueueModule,
-    BullModule.registerQueue({
-      name: 'code-review',
-    }),
-  ],
+  imports: [ConfigModule, GithubModule],
   controllers: [VcsController],
-  providers: [GithubService],
 })
-export class VcsModule {}
+export class VCSModule{};
