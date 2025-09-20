@@ -288,6 +288,73 @@ export class GithubService implements VCS {
     }
   }
 
+  async postReviewCommentsBatch(
+    installationId: number,
+    owner: string,
+    repo: string,
+    pullNumber: number,
+    comments: Array<{
+      file: string;
+      line: number;
+      comment: string;
+      diffHunk?: string;
+    }>,
+    commitId: string,
+  ): Promise<void> {
+    this.logger.log(
+      `Posting ${comments.length} comments in batch to PR #${pullNumber} in ${owner}/${repo}`,
+    );
+
+    if (comments.length === 0) {
+      this.logger.log('No comments to post in batch');
+      return;
+    }
+
+    try {
+      const octokit = await this.app.getInstallationOctokit(installationId);
+
+      // Prepare comments for GitHub API
+      const githubComments = comments.map(comment => ({
+        path: comment.file,
+        line: comment.line,
+        body: comment.comment,
+        ...(comment.diffHunk && { diff_hunk: comment.diffHunk }),
+      }));
+
+      // Use GitHub's "Create a review" endpoint for batch commenting
+      await octokit.request(
+        'POST /repos/{owner}/{repo}/pulls/{pull_number}/reviews',
+        {
+          owner,
+          repo,
+          pull_number: pullNumber,
+          body: `AI Code Review - ${comments.length} comments`,
+          event: 'COMMENT',
+          comments: githubComments,
+          commit_id: commitId,
+        },
+      );
+
+      this.logger.log(`Successfully posted ${comments.length} comments in batch to PR #${pullNumber}`);
+
+    } catch (error) {
+      this.logger.error(
+        `Failed to post ${comments.length} comments in batch to PR #${pullNumber} in ${owner}/${repo}`,
+        error.stack,
+      );
+
+      // Provide more specific error information
+      if (error.message?.includes('line must be part of the diff')) {
+        this.logger.error(`Some comments reference lines that are not part of the diff`);
+      }
+      if (error.message?.includes('diff_hunk')) {
+        this.logger.error(`Missing diff_hunk context for some comments`);
+      }
+
+      throw new Error(`Could not post ${comments.length} comments in batch to GitHub.`);
+    }
+  }
+
   async handleInstallationEvent(payload: any): Promise<void> {
     const { action, installation, repositories } = payload;
 

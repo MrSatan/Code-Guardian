@@ -34,4 +34,18 @@ export interface VCS {
     file: string,
     lineNumber: number,
   ): Promise<boolean>;
+
+  postReviewCommentsBatch(
+    installationId: number,
+    owner: string,
+    repo: string,
+    pullNumber: number,
+    comments: Array<{
+      file: string;
+      line: number;
+      comment: string;
+      diffHunk?: string;
+    }>,
+    commitId: string,
+  ): Promise<void>;
 }
