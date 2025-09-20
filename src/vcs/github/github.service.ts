@@ -190,6 +190,104 @@ export class GithubService implements VCS {
     this.logger.log(`Added job to code-review queue: ${JSON.stringify(job)}`);
   }
 
+  async validateLineInDiff(
+    installationId: number,
+    owner: string,
+    repo: string,
+    pullNumber: number,
+    file: string,
+    lineNumber: number,
+  ): Promise<boolean> {
+    this.logger.log(
+      `Validating if line ${lineNumber} in ${file} is part of PR #${pullNumber} diff`,
+    );
+
+    try {
+      // Get the diff for this PR
+      const diff = await this.getPullRequestDiff(installationId, owner, repo, pullNumber);
+
+      // Parse the diff to find hunks for the specific file
+      const lines = diff.split('\n');
+      let inTargetFile = false;
+      let currentHunkStartLine = 0;
+      let currentHunkNewStart = 0;
+
+      for (let i = 0; i < lines.length; i++) {
+        const line = lines[i];
+
+        // Check if we're entering the target file
+        if (line.startsWith('diff --git') && line.includes(file)) {
+          inTargetFile = true;
+          continue;
+        }
+
+        // If we hit another file's diff, we're done with this file
+        if (line.startsWith('diff --git') && inTargetFile && !line.includes(file)) {
+          break;
+        }
+
+        // Parse hunk headers for the target file
+        if (inTargetFile && line.startsWith('@@ ')) {
+          // Parse hunk header: @@ -oldStart,oldCount +newStart,newCount @@
+          const match = line.match(/@@ -(\d+),?\d* \+(\d+),?\d* @@/);
+          if (match) {
+            currentHunkNewStart = parseInt(match[2]);
+            currentHunkStartLine = i;
+          }
+        }
+
+        // Check if we're in a hunk and this line affects our target line
+        if (inTargetFile && currentHunkNewStart > 0) {
+          const relativeLineInHunk = i - currentHunkStartLine;
+
+          // Skip the hunk header line
+          if (relativeLineInHunk === 0) continue;
+
+          // Check if this line in the hunk corresponds to our target line
+          let currentLineInFile = currentHunkNewStart;
+          let hunkLineIndex = 1; // Start after hunk header
+
+          // Count through the hunk lines to see which file line they correspond to
+          while (hunkLineIndex <= relativeLineInHunk && i + hunkLineIndex - relativeLineInHunk < lines.length) {
+            const hunkLine = lines[currentHunkStartLine + hunkLineIndex];
+
+            if (hunkLine.startsWith('+')) {
+              // Addition line - this corresponds to a line in the new file
+              if (currentLineInFile === lineNumber) {
+                this.logger.log(`Line ${lineNumber} in ${file} is a valid addition in the diff`);
+                return true;
+              }
+              currentLineInFile++;
+            } else if (hunkLine.startsWith('-')) {
+              // Deletion line - this doesn't correspond to a line in the new file
+              // Don't increment currentLineInFile
+            } else if (hunkLine.startsWith(' ')) {
+              // Context line - this corresponds to a line in both files
+              if (currentLineInFile === lineNumber) {
+                this.logger.log(`Line ${lineNumber} in ${file} is a valid context line in the diff`);
+                return true;
+              }
+              currentLineInFile++;
+            }
+            // Skip other lines (like hunk headers we've already processed)
+
+            hunkLineIndex++;
+          }
+        }
+      }
+
+      this.logger.log(`Line ${lineNumber} in ${file} is NOT part of the diff`);
+      return false;
+    } catch (error) {
+      this.logger.error(
+        `Failed to validate line ${lineNumber} in ${file} for PR #${pullNumber}`,
+        error.stack,
+      );
+      // If we can't validate, err on the side of caution and return false
+      return false;
+    }
+  }
+
   async handleInstallationEvent(payload: any): Promise<void> {
     const { action, installation, repositories } = payload;
 

@@ -25,4 +25,13 @@ export interface VCS {
     path: string,
     commitId: string,
   ): Promise<string | null>;
+
+  validateLineInDiff(
+    installationId: number,
+    owner: string,
+    repo: string,
+    pullNumber: number,
+    file: string,
+    lineNumber: number,
+  ): Promise<boolean>;
 }

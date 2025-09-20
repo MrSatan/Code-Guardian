@@ -3,7 +3,7 @@ import { Logger } from '@nestjs/common';
 import { Job } from 'bullmq';
 import { PrismaService } from '../database/prisma.service';
 import { ReviewJobData } from './dto/review.dto';
-import { AIService } from '../ai/ai.service';
+import { AIService, AIFeedback } from '../ai/ai.service';
 import type { VCS } from '../vcs/vcs.interface';
 import { Inject } from '@nestjs/common';
 
@@ -105,19 +105,69 @@ export class ReviewProcessor extends WorkerHost {
       this.logger.warn(`- Check AI service logs for detailed error information`);
     }
 
+    // Track successful and failed comments separately
+    const successfulComments: AIFeedback[] = [];
+    const failedComments: Array<{ item: AIFeedback; error: string }> = [];
+
     for (const item of feedback) {
-      this.logger.log(`Posting comment for ${item.file}:${item.line}`);
-      await this.vcsService.postReviewComment(
-        installationId,
-        owner,
-        repo,
-        pullNumber,
-        item.comment,
-        item.file,
-        item.line,
-        commitSha,
-        item.diffHunk, // Include diff hunk context for GitHub API
-      );
+      try {
+        this.logger.log(`Processing comment for ${item.file}:${item.line}`);
+
+        // Validate that the line is actually part of the diff before posting
+        const isValidLine = await this.vcsService.validateLineInDiff(
+          installationId,
+          owner,
+          repo,
+          pullNumber,
+          item.file,
+          item.line,
+        );
+
+        if (!isValidLine) {
+          const errorMsg = `Line ${item.line} in ${item.file} is not part of the actual diff`;
+          this.logger.warn(`Skipping comment: ${errorMsg}`);
+          failedComments.push({ item, error: errorMsg });
+          continue; // Skip this comment but continue with others
+        }
+
+        // Post the validated comment
+        this.logger.log(`Posting validated comment for ${item.file}:${item.line}`);
+        await this.vcsService.postReviewComment(
+          installationId,
+          owner,
+          repo,
+          pullNumber,
+          item.comment,
+          item.file,
+          item.line,
+          commitSha,
+          item.diffHunk, // Include diff hunk context for GitHub API
+        );
+
+        // Track successful comments
+        successfulComments.push(item);
+        this.logger.log(`Successfully posted comment for ${item.file}:${item.line}`);
+
+      } catch (error) {
+        // Log the error but continue processing other comments
+        const errorMsg = `Failed to post comment: ${error.message}`;
+        this.logger.error(`Comment failed for ${item.file}:${item.line}:`, error.message);
+        failedComments.push({ item, error: errorMsg });
+        continue; // Continue with next comment instead of failing the job
+      }
+    }
+
+    // Log summary of results
+    this.logger.log(`Comment posting complete:`);
+    this.logger.log(`- Successful: ${successfulComments.length}`);
+    this.logger.log(`- Failed: ${failedComments.length}`);
+    this.logger.log(`- Total: ${feedback.length}`);
+
+    if (failedComments.length > 0) {
+      this.logger.warn(`Failed comments:`);
+      failedComments.forEach(({ item, error }) => {
+        this.logger.warn(`  - ${item.file}:${item.line}: ${error}`);
+      });
     }
 
     // Update review with results
