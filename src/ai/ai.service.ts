@@ -60,7 +60,7 @@ export class AIService {
 
     this.model = new ChatGoogleGenerativeAI({
       apiKey,
-      model: 'gemini-2.5-flash-lite',
+      model: 'gemini-2.0-flash',
       temperature: 0.7,
       maxOutputTokens,
     });
@@ -97,21 +97,46 @@ export class AIService {
 
     const prompt = new PromptTemplate({
       template: `
-        You are an expert code reviewer. Your task is to analyze the following code diff and provide feedback.
-        Focus on identifying potential bugs, performance issues, and deviations from best practices.
-        Do not comment on code style.
-        The output should be a JSON array of objects, where each object has the following format:
-        {{
-          "file": "path/to/file",
-          "line": <line_number>,
-          "comment": "Your comment here"
-        }}
+You are an expert senior software engineer conducting a thorough code review.
 
-        Here are the custom rules to follow:
-        {rules}
+CONTEXT: You are reviewing code changes in a Git diff. Focus on:
+- Code quality and best practices
+- Potential bugs or security issues
+- Performance considerations
+- Code maintainability and readability
+- Proper error handling
 
-        Here is the code diff:
-        {diff}
+CRITICAL JSON FORMATTING REQUIREMENTS:
+- Return ONLY a valid JSON array
+- NO markdown formatting or code blocks
+- NO explanations outside the JSON
+- Each object must have exactly these fields: file, line, comment
+- Use double quotes for all strings
+- Ensure all brackets and commas are properly closed
+
+REQUIRED JSON FORMAT:
+[
+  {{
+    "file": "exact/path/from/diff",
+    "line": 123,
+    "comment": "Specific, actionable feedback about the actual code change"
+  }}
+]
+
+REVIEW GUIDELINES:
+- Comment ONLY on code that appears in the diff
+- Reference specific functions, variables, or logic from the diff
+- Suggest concrete improvements
+- Point out potential issues with the actual code changes
+- Ignore any code that is not shown in the diff
+
+Custom rules to follow:
+{rules}
+
+Code diff to review:
+{diff}
+
+Return your review as a JSON array only.
       `,
       inputVariables: ['diff', 'rules'],
     });
@@ -334,32 +359,46 @@ export class AIService {
 
     const prompt = new PromptTemplate({
       template: `
-        You are an expert code reviewer. Your task is to analyze the following code diff chunk and provide feedback.
-        Focus on identifying potential bugs, performance issues, and deviations from best practices.
-        Do not comment on code style.
+You are an expert senior software engineer conducting a thorough code review of a specific code chunk.
 
-        CRITICAL REQUIREMENTS:
-        1. Only comment on lines that actually exist in the diff
-        2. Your comments must be specific to the code shown in the diff lines
-        3. Do not make up or hallucinate code that isn't in the diff
-        4. Focus on the actual changes: additions (+), deletions (-), and context lines ( )
+CONTEXT: You are reviewing a portion of code changes from a Git diff. Focus on:
+- Code quality and best practices in this specific chunk
+- Potential bugs or security issues in the changed code
+- Performance considerations for the modified functions
+- Code maintainability and readability improvements
+- Proper error handling in the changed logic
 
-        IMPORTANT: Your response must be valid JSON. Return an empty array [] if you find no issues.
+CRITICAL JSON FORMATTING REQUIREMENTS:
+- Return ONLY a valid JSON array
+- NO markdown formatting or code blocks
+- NO explanations outside the JSON
+- Each object must have exactly these fields: file, line, comment
+- Use double quotes for all strings
+- Ensure all brackets and commas are properly closed
 
-        The output should be a JSON array of objects, where each object has the following format:
-        {{
-          "file": "path/to/file",
-          "line": <line_number>,
-          "comment": "Your comment here - be specific to the actual code change shown in the diff"
-        }}
+REQUIRED JSON FORMAT:
+[
+  {{
+    "file": "exact/path/from/diff",
+    "line": 123,
+    "comment": "Specific, actionable feedback about the actual code change in this chunk"
+  }}
+]
 
-        Here are the custom rules to follow:
-        {rules}
+CHUNK REVIEW GUIDELINES:
+- Comment ONLY on code that appears in this specific chunk
+- Reference specific functions, variables, or logic from this chunk
+- Suggest concrete improvements to the code shown
+- Point out potential issues with the actual changes in this chunk
+- Stay focused on this chunk's content only
 
-        Here is the code diff chunk to analyze:
-        {diff}
+Custom rules to follow:
+{rules}
 
-        REMEMBER: Only comment on the actual code changes you see in the diff above. Do not reference code that isn't shown.
+Code diff chunk to review:
+{diff}
+
+Return your review as a JSON array only.
       `,
       inputVariables: ['diff', 'rules'],
     });
@@ -485,62 +524,133 @@ export class AIService {
 
   private buildLineToCodeMap(diffChunk: string): Map<number, string> {
     const lineToCodeMap = new Map<number, string>();
+
+    try {
+      // Pre-validate diff format
+      if (!this.isValidGitDiff(diffChunk)) {
+        this.logger.warn('Invalid Git diff format detected, using fallback parsing');
+        return this.fallbackLineMapping(diffChunk);
+      }
+
+      const lines = diffChunk.split('\n');
+      let currentHunkStartLine = 0;
+      let inHunk = false;
+
+      this.logger.debug(`Building line-to-code map for diff chunk with ${lines.length} lines`);
+
+      for (let i = 0; i < lines.length; i++) {
+        const line = lines[i];
+
+        // Parse hunk headers with better error handling
+        if (line.startsWith('@@ ')) {
+          const hunkInfo = this.parseHunkHeader(line);
+          if (hunkInfo) {
+            currentHunkStartLine = hunkInfo.newStart;
+            inHunk = true;
+            this.logger.debug(`Parsed hunk header: newStart=${currentHunkStartLine}`);
+          } else {
+            this.logger.warn(`Failed to parse hunk header: ${line}`);
+          }
+          continue;
+        }
+
+        // Skip file headers and metadata
+        if (line.startsWith('diff --git') || line.startsWith('index ') ||
+            line.startsWith('--- ') || line.startsWith('+++ ')) {
+          continue;
+        }
+
+        // Process hunk content
+        if (inHunk && currentHunkStartLine > 0) {
+          const lineType = this.getLineType(line);
+
+          switch (lineType) {
+            case 'addition':
+              const addCode = line.substring(1);
+              lineToCodeMap.set(currentHunkStartLine, addCode);
+              currentHunkStartLine++;
+              break;
+
+            case 'context':
+              const contextCode = line.substring(1);
+              lineToCodeMap.set(currentHunkStartLine, contextCode);
+              currentHunkStartLine++;
+              break;
+
+            case 'deletion':
+              // Deletions don't affect current file line numbers
+              // but we track them for completeness
+              break;
+
+            case 'metadata':
+              // Skip hunk metadata lines
+              break;
+          }
+        }
+      }
+
+      // Post-validation
+      if (lineToCodeMap.size === 0) {
+        this.logger.warn('No line mappings created, diff might be empty or malformed');
+      } else {
+        this.logger.debug(`Successfully created ${lineToCodeMap.size} line-to-code mappings`);
+      }
+
+    } catch (error) {
+      this.logger.error(`Error building line-to-code map: ${error.message}`);
+      // Return empty map on error to prevent crashes
+      return new Map<number, string>();
+    }
+
+    return lineToCodeMap;
+  }
+
+  private isValidGitDiff(diff: string): boolean {
+    // Basic validation for Git diff format
+    const hasDiffMarker = diff.includes('diff --git');
+    const hasHunkMarker = diff.includes('@@ ');
+    const hasChanges = diff.includes('+') || diff.includes('-');
+
+    return hasDiffMarker && hasHunkMarker && hasChanges;
+  }
+
+  private parseHunkHeader(headerLine: string): { oldStart: number; newStart: number } | null {
+    // More robust hunk header parsing
+    const match = headerLine.match(/@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
+    if (match) {
+      return {
+        oldStart: parseInt(match[1]),
+        newStart: parseInt(match[2])
+      };
+    }
+    return null;
+  }
+
+  private getLineType(line: string): 'addition' | 'deletion' | 'context' | 'metadata' {
+    if (line.startsWith('+')) return 'addition';
+    if (line.startsWith('-')) return 'deletion';
+    if (line.startsWith(' ')) return 'context';
+    return 'metadata';
+  }
+
+  private fallbackLineMapping(diffChunk: string): Map<number, string> {
+    // Simple fallback for malformed diffs
+    this.logger.warn('Using fallback line mapping for malformed diff');
+    const lineToCodeMap = new Map<number, string>();
     const lines = diffChunk.split('\n');
 
-    let currentFile = '';
-    let currentHunkStartLine = 0;
-    let inHunk = false;
-
-    this.logger.debug(`Building line-to-code map for diff chunk with ${lines.length} lines`);
-
-    for (let i = 0; i < lines.length; i++) {
-      const line = lines[i];
-
-      // Track current file
-      if (line.startsWith('diff --git')) {
-        const match = line.match(/diff --git a\/(.+) b\/(.+)/);
-        if (match) {
-          currentFile = match[1];
-          this.logger.debug(`Processing file: ${currentFile}`);
-        }
-        inHunk = false; // Reset hunk state for new file
-      }
-
-      // Parse hunk headers
-      if (line.startsWith('@@ ')) {
-        const match = line.match(/@@ -(\d+),?\d* \+(\d+),?\d* @@/);
-        if (match) {
-          currentHunkStartLine = parseInt(match[2]);
-          inHunk = true;
-          this.logger.debug(`Starting hunk at line ${currentHunkStartLine} for file ${currentFile}`);
-        }
-      }
-
-      // Map line numbers to their actual code content
-      if (inHunk && currentHunkStartLine > 0) {
-        if (line.startsWith('+')) {
-          // Addition line - this corresponds to new code in the file
-          const code = line.substring(1); // Remove + prefix
-          lineToCodeMap.set(currentHunkStartLine, code);
-          this.logger.debug(`Mapped line ${currentHunkStartLine}: ${code.trim()}`);
-          currentHunkStartLine++;
-        } else if (line.startsWith(' ')) {
-          // Context line - this corresponds to existing code in the file
-          const code = line.substring(1); // Remove space prefix
-          lineToCodeMap.set(currentHunkStartLine, code);
-          this.logger.debug(`Mapped context line ${currentHunkStartLine}: ${code.trim()}`);
-          currentHunkStartLine++;
-        } else if (line.startsWith('-')) {
-          // Deletion line - this represents code that was removed
-          // Don't increment line counter, but log it for debugging
-          const removedCode = line.substring(1);
-          this.logger.debug(`Removed line ${currentHunkStartLine}: ${removedCode.trim()}`);
-          // Note: We don't map removed lines to current line numbers
-        }
+    // Very basic fallback - look for any lines that look like code
+    let lineNumber = 1;
+    for (const line of lines) {
+      if (line.length > 0 && !line.startsWith('diff') && !line.startsWith('@@') &&
+          !line.startsWith('---') && !line.startsWith('+++') && !line.startsWith('index')) {
+        // This might be a code line, map it
+        lineToCodeMap.set(lineNumber, line);
+        lineNumber++;
       }
     }
 
-    this.logger.debug(`Completed line-to-code mapping: ${lineToCodeMap.size} mappings created`);
+    this.logger.warn(`Fallback mapping created ${lineToCodeMap.size} basic mappings`);
     return lineToCodeMap;
   }
 
