@@ -31,6 +31,7 @@
     "bullmq": "^5.58.5",
     "langchain": "^0.3.33",
     "octokit": "^5.0.3",
+    "parse-diff": "^0.11.1",
     "reflect-metadata": "^0.2.2",
     "rxjs": "^7.8.1"
   },

@@ -60,7 +60,7 @@ export class AIService {
 
     this.model = new ChatGoogleGenerativeAI({
       apiKey,
-      model: 'gemini-2.5-flash-lite',
+      model: 'gemini-2.0-flash',
       temperature: 0.7,
       maxOutputTokens,
     });
@@ -97,21 +97,46 @@ export class AIService {
 
     const prompt = new PromptTemplate({
       template: `
-        You are an expert code reviewer. Your task is to analyze the following code diff and provide feedback.
-        Focus on identifying potential bugs, performance issues, and deviations from best practices.
-        Do not comment on code style.
-        The output should be a JSON array of objects, where each object has the following format:
-        {{
-          "file": "path/to/file",
-          "line": <line_number>,
-          "comment": "Your comment here"
-        }}
+You are an expert senior software engineer conducting a thorough code review.
 
-        Here are the custom rules to follow:
-        {rules}
+CONTEXT: You are reviewing code changes in a Git diff. Focus on:
+- Code quality and best practices
+- Potential bugs or security issues
+- Performance considerations
+- Code maintainability and readability
+- Proper error handling
 
-        Here is the code diff:
-        {diff}
+CRITICAL JSON FORMATTING REQUIREMENTS:
+- Return ONLY a valid JSON array
+- NO markdown formatting or code blocks
+- NO explanations outside the JSON
+- Each object must have exactly these fields: file, line, comment
+- Use double quotes for all strings
+- Ensure all brackets and commas are properly closed
+
+REQUIRED JSON FORMAT:
+[
+  {{
+    "file": "exact/path/from/diff",
+    "line": 123,
+    "comment": "Specific, actionable feedback about the actual code change"
+  }}
+]
+
+REVIEW GUIDELINES:
+- Comment ONLY on code that appears in the diff
+- Reference specific functions, variables, or logic from the diff
+- Suggest concrete improvements
+- Point out potential issues with the actual code changes
+- Ignore any code that is not shown in the diff
+
+Custom rules to follow:
+{rules}
+
+Code diff to review:
+{diff}
+
+Return your review as a JSON array only.
       `,
       inputVariables: ['diff', 'rules'],
     });
@@ -324,31 +349,56 @@ export class AIService {
     diffChunk: string,
     customRules: string | null,
   ): Promise<AIFeedback[]> {
-    // Extract diff hunks for context
+    // Extract diff hunks for context and line mapping
     const diffHunks = this.extractDiffHunks(diffChunk);
+
+    // Build a map of line numbers to their actual code content
+    const lineToCodeMap = this.buildLineToCodeMap(diffChunk);
 
     const parser = new JsonOutputParser<AIFeedback[]>();
 
     const prompt = new PromptTemplate({
       template: `
-        You are an expert code reviewer. Your task is to analyze the following code diff chunk and provide feedback.
-        Focus on identifying potential bugs, performance issues, and deviations from best practices.
-        Do not comment on code style.
+You are an expert senior software engineer conducting a thorough code review of a specific code chunk.
 
-        IMPORTANT: Your response must be valid JSON. Return an empty array [] if you find no issues.
+CONTEXT: You are reviewing a portion of code changes from a Git diff. Focus on:
+- Code quality and best practices in this specific chunk
+- Potential bugs or security issues in the changed code
+- Performance considerations for the modified functions
+- Code maintainability and readability improvements
+- Proper error handling in the changed logic
 
-        The output should be a JSON array of objects, where each object has the following format:
-        {{
-          "file": "path/to/file",
-          "line": <line_number>,
-          "comment": "Your comment here"
-        }}
+CRITICAL JSON FORMATTING REQUIREMENTS:
+- Return ONLY a valid JSON array
+- NO markdown formatting or code blocks
+- NO explanations outside the JSON
+- Each object must have exactly these fields: file, line, comment
+- Use double quotes for all strings
+- Ensure all brackets and commas are properly closed
 
-        Here are the custom rules to follow:
-        {rules}
+REQUIRED JSON FORMAT:
+[
+  {{
+    "file": "exact/path/from/diff",
+    "line": 123,
+    "comment": "Specific, actionable feedback about the actual code change in this chunk"
+  }}
+]
 
-        Here is the code diff chunk:
-        {diff}
+CHUNK REVIEW GUIDELINES:
+- Comment ONLY on code that appears in this specific chunk
+- Reference specific functions, variables, or logic from this chunk
+- Suggest concrete improvements to the code shown
+- Point out potential issues with the actual changes in this chunk
+- Stay focused on this chunk's content only
+
+Custom rules to follow:
+{rules}
+
+Code diff chunk to review:
+{diff}
+
+Return your review as a JSON array only.
       `,
       inputVariables: ['diff', 'rules'],
     });
@@ -383,14 +433,75 @@ export class AIService {
         .map(item => {
           // Find the appropriate diff hunk for this line
           const diffHunk = this.findDiffHunkForLine(diffHunks, item.line);
+
+          // Validate that the comment is relevant to the actual code at this line
+          const actualCode = lineToCodeMap.get(item.line);
+          if (actualCode) {
+            this.logger.log(`Line ${item.line} code: ${actualCode.trim()}`);
+          }
+
           return {
             ...item,
             diffHunk: diffHunk || undefined
           };
+        })
+        .filter(item => {
+          // Additional validation: ensure the comment is relevant to the actual code
+          const actualCode = lineToCodeMap.get(item.line);
+          if (!actualCode) {
+            this.logger.warn(`No code found at line ${item.line} - filtering out comment`);
+            return false;
+          }
+
+          // Strict relevance check - ensure comment is specifically about the actual code
+          const codeLower = actualCode.toLowerCase();
+          const commentLower = item.comment.toLowerCase();
+
+          // Extract meaningful keywords from the actual code
+          const codeKeywords = this.extractCodeKeywords(actualCode);
+          const commentWords = commentLower.split(/\s+/);
+
+          // Check for exact matches or very close matches
+          let relevanceScore = 0;
+
+          // Exact keyword matches
+          for (const keyword of codeKeywords) {
+            if (commentLower.includes(keyword.toLowerCase())) {
+              relevanceScore += 2;
+            }
+          }
+
+          // Check for variable/method names in the code
+          const varMatches = actualCode.match(/\b[a-zA-Z_$][a-zA-Z0-9_$]*\b/g);
+          if (varMatches) {
+            for (const varName of varMatches) {
+              if (commentLower.includes(varName.toLowerCase())) {
+                relevanceScore += 3; // Higher weight for exact variable matches
+              }
+            }
+          }
+
+          // Check for specific patterns that indicate relevance
+          if (codeLower.includes('if (!') && commentLower.includes('check')) relevanceScore += 2;
+          if (codeLower.includes('return') && commentLower.includes('return')) relevanceScore += 1;
+          if (codeLower.includes('error') && commentLower.includes('error')) relevanceScore += 2;
+          if (codeLower.includes('status') && commentLower.includes('status')) relevanceScore += 2;
+
+          // Require minimum relevance score
+          if (relevanceScore < 2) {
+            this.logger.warn(`Comment on line ${item.line} has low relevance (score: ${relevanceScore}) - filtering out`);
+            this.logger.warn(`Code: "${actualCode.trim()}"`);
+            this.logger.warn(`Comment: "${item.comment}"`);
+            this.logger.warn(`Code keywords: [${codeKeywords.join(', ')}]`);
+            return false;
+          }
+
+          this.logger.debug(`Comment on line ${item.line} passed relevance check (score: ${relevanceScore})`);
+          return true;
         });
 
       if (validFeedback.length !== feedback.length) {
-        this.logger.warn(`Filtered out ${feedback.length - validFeedback.length} invalid feedback items`);
+        this.logger.warn(`Filtered out ${feedback.length - validFeedback.length} invalid/irrelevant feedback items`);
       }
 
       return validFeedback;
@@ -409,6 +520,166 @@ export class AIService {
       // Return empty array instead of throwing
       return [];
     }
+  }
+
+  private buildLineToCodeMap(diffChunk: string): Map<number, string> {
+    const lineToCodeMap = new Map<number, string>();
+
+    try {
+      // Pre-validate diff format
+      if (!this.isValidGitDiff(diffChunk)) {
+        this.logger.warn('Invalid Git diff format detected, using fallback parsing');
+        return this.fallbackLineMapping(diffChunk);
+      }
+
+      const lines = diffChunk.split('\n');
+      let currentHunkStartLine = 0;
+      let inHunk = false;
+
+      this.logger.debug(`Building line-to-code map for diff chunk with ${lines.length} lines`);
+
+      for (let i = 0; i < lines.length; i++) {
+        const line = lines[i];
+
+        // Parse hunk headers with better error handling
+        if (line.startsWith('@@ ')) {
+          const hunkInfo = this.parseHunkHeader(line);
+          if (hunkInfo) {
+            currentHunkStartLine = hunkInfo.newStart;
+            inHunk = true;
+            this.logger.debug(`Parsed hunk header: newStart=${currentHunkStartLine}`);
+          } else {
+            this.logger.warn(`Failed to parse hunk header: ${line}`);
+          }
+          continue;
+        }
+
+        // Skip file headers and metadata
+        if (line.startsWith('diff --git') || line.startsWith('index ') ||
+            line.startsWith('--- ') || line.startsWith('+++ ')) {
+          continue;
+        }
+
+        // Process hunk content
+        if (inHunk && currentHunkStartLine > 0) {
+          const lineType = this.getLineType(line);
+
+          switch (lineType) {
+            case 'addition':
+              const addCode = line.substring(1);
+              lineToCodeMap.set(currentHunkStartLine, addCode);
+              currentHunkStartLine++;
+              break;
+
+            case 'context':
+              const contextCode = line.substring(1);
+              lineToCodeMap.set(currentHunkStartLine, contextCode);
+              currentHunkStartLine++;
+              break;
+
+            case 'deletion':
+              // Deletions don't affect current file line numbers
+              // but we track them for completeness
+              break;
+
+            case 'metadata':
+              // Skip hunk metadata lines
+              break;
+          }
+        }
+      }
+
+      // Post-validation
+      if (lineToCodeMap.size === 0) {
+        this.logger.warn('No line mappings created, diff might be empty or malformed');
+      } else {
+        this.logger.debug(`Successfully created ${lineToCodeMap.size} line-to-code mappings`);
+      }
+
+    } catch (error) {
+      this.logger.error(`Error building line-to-code map: ${error.message}`);
+      // Return empty map on error to prevent crashes
+      return new Map<number, string>();
+    }
+
+    return lineToCodeMap;
+  }
+
+  private isValidGitDiff(diff: string): boolean {
+    // Basic validation for Git diff format
+    const hasDiffMarker = diff.includes('diff --git');
+    const hasHunkMarker = diff.includes('@@ ');
+    const hasChanges = diff.includes('+') || diff.includes('-');
+
+    return hasDiffMarker && hasHunkMarker && hasChanges;
+  }
+
+  private parseHunkHeader(headerLine: string): { oldStart: number; newStart: number } | null {
+    // More robust hunk header parsing
+    const match = headerLine.match(/@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
+    if (match) {
+      return {
+        oldStart: parseInt(match[1]),
+        newStart: parseInt(match[2])
+      };
+    }
+    return null;
+  }
+
+  private getLineType(line: string): 'addition' | 'deletion' | 'context' | 'metadata' {
+    if (line.startsWith('+')) return 'addition';
+    if (line.startsWith('-')) return 'deletion';
+    if (line.startsWith(' ')) return 'context';
+    return 'metadata';
+  }
+
+  private fallbackLineMapping(diffChunk: string): Map<number, string> {
+    // Simple fallback for malformed diffs
+    this.logger.warn('Using fallback line mapping for malformed diff');
+    const lineToCodeMap = new Map<number, string>();
+    const lines = diffChunk.split('\n');
+
+    // Very basic fallback - look for any lines that look like code
+    let lineNumber = 1;
+    for (const line of lines) {
+      if (line.length > 0 && !line.startsWith('diff') && !line.startsWith('@@') &&
+          !line.startsWith('---') && !line.startsWith('+++') && !line.startsWith('index')) {
+        // This might be a code line, map it
+        lineToCodeMap.set(lineNumber, line);
+        lineNumber++;
+      }
+    }
+
+    this.logger.warn(`Fallback mapping created ${lineToCodeMap.size} basic mappings`);
+    return lineToCodeMap;
+  }
+
+  private extractCodeKeywords(code: string): string[] {
+    const keywords: string[] = [];
+
+    // Extract variable names, function names, etc.
+    const varMatches = code.match(/\b[a-zA-Z_$][a-zA-Z0-9_$]*\b/g);
+    if (varMatches) {
+      keywords.push(...varMatches);
+    }
+
+    // Extract string literals
+    const stringMatches = code.match(/'([^']*)'|"([^"]*)"/g);
+    if (stringMatches) {
+      keywords.push(...stringMatches.map(s => s.slice(1, -1)));
+    }
+
+    // Extract common keywords from the code
+    const codeLower = code.toLowerCase();
+    if (codeLower.includes('req.')) keywords.push('request', 'req');
+    if (codeLower.includes('res.')) keywords.push('response', 'res');
+    if (codeLower.includes('secret')) keywords.push('secret', 'webhook');
+    if (codeLower.includes('signature')) keywords.push('signature', 'crypto');
+    if (codeLower.includes('rawbody') || codeLower.includes('rawBody')) keywords.push('rawbody', 'body');
+    if (codeLower.includes('middleware')) keywords.push('middleware');
+    if (codeLower.includes('timingSafeEqual')) keywords.push('timingSafeEqual', 'crypto');
+
+    return [...new Set(keywords)]; // Remove duplicates
   }
 
   private extractDiffHunks(diffChunk: string): Array<{ header: string; content: string; startLine: number; endLine: number }> {
