@@ -15,6 +15,7 @@ export interface VCS {
     file: string,
     lineNumber: number,
     commitId: string,
+    diffHunk?: string,
   ): Promise<void>;
 
   getFileContent(

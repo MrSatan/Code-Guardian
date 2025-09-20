@@ -73,6 +73,7 @@ export class GithubService implements VCS {
     file: string,
     lineNumber: number,
     commitId: string,
+    diffHunk?: string,
   ): Promise<void> {
     this.logger.log(
       `Posting comment to PR #${pullNumber} in ${owner}/${repo} on ${file}:${lineNumber}`,
@@ -81,23 +82,42 @@ export class GithubService implements VCS {
     try {
       const octokit = await this.app.getInstallationOctokit(installationId);
 
+      const commentData: any = {
+        owner,
+        repo,
+        pull_number: pullNumber,
+        body: comment,
+        path: file,
+        line: lineNumber,
+        commit_id: commitId,
+      };
+
+      // Add diff_hunk if provided (required for accurate line positioning)
+      if (diffHunk) {
+        commentData.diff_hunk = diffHunk;
+        this.logger.log(`Including diff_hunk for accurate line positioning`);
+      }
+
       await octokit.request(
         'POST /repos/{owner}/{repo}/pulls/{pull_number}/comments',
-        {
-          owner,
-          repo,
-          pull_number: pullNumber,
-          body: comment,
-          path: file,
-          line: lineNumber,
-          commit_id: commitId,
-        },
+        commentData,
       );
+
+      this.logger.log(`Successfully posted comment on ${file}:${lineNumber}`);
     } catch (error) {
       this.logger.error(
         `Failed to post comment to PR #${pullNumber} in ${owner}/${repo}`,
         error.stack,
       );
+
+      // Provide more specific error information
+      if (error.message?.includes('line must be part of the diff')) {
+        this.logger.error(`Line ${lineNumber} in ${file} is not part of the actual diff. This may be due to chunking.`);
+      }
+      if (error.message?.includes('diff_hunk')) {
+        this.logger.error(`Missing diff_hunk context for line ${lineNumber} in ${file}.`);
+      }
+
       throw new Error('Could not post comment to GitHub.');
     }
   }

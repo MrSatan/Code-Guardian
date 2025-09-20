@@ -33,8 +33,18 @@ export class ReviewProcessor extends WorkerHost {
       throw new Error(`Repository with installationId ${installationId} not found.`);
     }
 
-    const review = await this.prisma.review.create({
-      data: {
+    // Use upsert to handle duplicate PR processing gracefully
+    const review = await this.prisma.review.upsert({
+      where: {
+        pullRequestId: pullRequestId,
+      },
+      update: {
+        // Reset status for reprocessing if it was previously failed/completed
+        status: 'PENDING',
+        commitSha, // Update with latest commit
+        updatedAt: new Date(),
+      },
+      create: {
         pullRequestNumber: pullNumber,
         pullRequestId: pullRequestId,
         commitSha,
@@ -43,7 +53,23 @@ export class ReviewProcessor extends WorkerHost {
       },
     });
 
-    this.logger.log(`Created review ${review.id} for PR #${pullNumber}`);
+    // Log whether this was a new review or an existing one being reprocessed
+    if (review.updatedAt && review.updatedAt > review.createdAt) {
+      this.logger.log(`Reprocessing existing review ${review.id} for PR #${pullNumber}`);
+    } else {
+      this.logger.log(`Created new review ${review.id} for PR #${pullNumber}`);
+    }
+
+    // Update status to PROCESSING
+    try {
+      await this.prisma.review.update({
+        where: { id: review.id },
+        data: { status: 'PROCESSING' },
+      });
+    } catch (error) {
+      this.logger.warn(`Failed to update review status to PROCESSING:`, error.message);
+      // Continue processing anyway - this is not a critical error
+    }
 
     const diff = await this.vcsService.getPullRequestDiff(
       installationId,
@@ -66,11 +92,21 @@ export class ReviewProcessor extends WorkerHost {
       this.logger.log('Found .codeguardian.yml file with custom rules.');
     }
 
+    this.logger.log(`Calling AI service to analyze diff...`);
     const feedback = await this.aiService.analyzeDiff(diff, rules);
 
     this.logger.log(`Received ${feedback.length} feedback items from AI.`);
 
+    if (feedback.length === 0) {
+      this.logger.warn(`No feedback received from AI for PR #${pullNumber}. This may indicate:`);
+      this.logger.warn(`- Token limit exceeded for large diff`);
+      this.logger.warn(`- AI processing failure`);
+      this.logger.warn(`- Invalid JSON response from AI`);
+      this.logger.warn(`- Check AI service logs for detailed error information`);
+    }
+
     for (const item of feedback) {
+      this.logger.log(`Posting comment for ${item.file}:${item.line}`);
       await this.vcsService.postReviewComment(
         installationId,
         owner,
@@ -80,18 +116,25 @@ export class ReviewProcessor extends WorkerHost {
         item.file,
         item.line,
         commitSha,
+        item.diffHunk, // Include diff hunk context for GitHub API
       );
     }
 
-    await this.prisma.review.update({
-      where: { id: review.id },
-      data: {
-        status: 'COMPLETED',
-        result: feedback as any, // Prisma expects JsonValue
-      },
-    });
-
-    this.logger.log(`Review ${review.id} completed successfully.`);
+    // Update review with results
+    try {
+      await this.prisma.review.update({
+        where: { id: review.id },
+        data: {
+          status: 'COMPLETED',
+          result: feedback as any, // Prisma expects JsonValue
+        },
+      });
+      this.logger.log(`Review ${review.id} completed successfully.`);
+    } catch (error) {
+      this.logger.error(`Failed to update review ${review.id} to COMPLETED:`, error.message);
+      // Don't throw here - the review was processed successfully, just the DB update failed
+      this.logger.log(`Review processing completed but database update failed for review ${review.id}`);
+    }
 
     return { feedback };
   }
