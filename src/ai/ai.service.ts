@@ -324,8 +324,11 @@ export class AIService {
     diffChunk: string,
     customRules: string | null,
   ): Promise<AIFeedback[]> {
-    // Extract diff hunks for context
+    // Extract diff hunks for context and line mapping
     const diffHunks = this.extractDiffHunks(diffChunk);
+
+    // Build a map of line numbers to their actual code content
+    const lineToCodeMap = this.buildLineToCodeMap(diffChunk);
 
     const parser = new JsonOutputParser<AIFeedback[]>();
 
@@ -335,20 +338,28 @@ export class AIService {
         Focus on identifying potential bugs, performance issues, and deviations from best practices.
         Do not comment on code style.
 
+        CRITICAL REQUIREMENTS:
+        1. Only comment on lines that actually exist in the diff
+        2. Your comments must be specific to the code shown in the diff lines
+        3. Do not make up or hallucinate code that isn't in the diff
+        4. Focus on the actual changes: additions (+), deletions (-), and context lines ( )
+
         IMPORTANT: Your response must be valid JSON. Return an empty array [] if you find no issues.
 
         The output should be a JSON array of objects, where each object has the following format:
         {{
           "file": "path/to/file",
           "line": <line_number>,
-          "comment": "Your comment here"
+          "comment": "Your comment here - be specific to the actual code change shown in the diff"
         }}
 
         Here are the custom rules to follow:
         {rules}
 
-        Here is the code diff chunk:
+        Here is the code diff chunk to analyze:
         {diff}
+
+        REMEMBER: Only comment on the actual code changes you see in the diff above. Do not reference code that isn't shown.
       `,
       inputVariables: ['diff', 'rules'],
     });
@@ -383,14 +394,75 @@ export class AIService {
         .map(item => {
           // Find the appropriate diff hunk for this line
           const diffHunk = this.findDiffHunkForLine(diffHunks, item.line);
+
+          // Validate that the comment is relevant to the actual code at this line
+          const actualCode = lineToCodeMap.get(item.line);
+          if (actualCode) {
+            this.logger.log(`Line ${item.line} code: ${actualCode.trim()}`);
+          }
+
           return {
             ...item,
             diffHunk: diffHunk || undefined
           };
+        })
+        .filter(item => {
+          // Additional validation: ensure the comment is relevant to the actual code
+          const actualCode = lineToCodeMap.get(item.line);
+          if (!actualCode) {
+            this.logger.warn(`No code found at line ${item.line} - filtering out comment`);
+            return false;
+          }
+
+          // Strict relevance check - ensure comment is specifically about the actual code
+          const codeLower = actualCode.toLowerCase();
+          const commentLower = item.comment.toLowerCase();
+
+          // Extract meaningful keywords from the actual code
+          const codeKeywords = this.extractCodeKeywords(actualCode);
+          const commentWords = commentLower.split(/\s+/);
+
+          // Check for exact matches or very close matches
+          let relevanceScore = 0;
+
+          // Exact keyword matches
+          for (const keyword of codeKeywords) {
+            if (commentLower.includes(keyword.toLowerCase())) {
+              relevanceScore += 2;
+            }
+          }
+
+          // Check for variable/method names in the code
+          const varMatches = actualCode.match(/\b[a-zA-Z_$][a-zA-Z0-9_$]*\b/g);
+          if (varMatches) {
+            for (const varName of varMatches) {
+              if (commentLower.includes(varName.toLowerCase())) {
+                relevanceScore += 3; // Higher weight for exact variable matches
+              }
+            }
+          }
+
+          // Check for specific patterns that indicate relevance
+          if (codeLower.includes('if (!') && commentLower.includes('check')) relevanceScore += 2;
+          if (codeLower.includes('return') && commentLower.includes('return')) relevanceScore += 1;
+          if (codeLower.includes('error') && commentLower.includes('error')) relevanceScore += 2;
+          if (codeLower.includes('status') && commentLower.includes('status')) relevanceScore += 2;
+
+          // Require minimum relevance score
+          if (relevanceScore < 2) {
+            this.logger.warn(`Comment on line ${item.line} has low relevance (score: ${relevanceScore}) - filtering out`);
+            this.logger.warn(`Code: "${actualCode.trim()}"`);
+            this.logger.warn(`Comment: "${item.comment}"`);
+            this.logger.warn(`Code keywords: [${codeKeywords.join(', ')}]`);
+            return false;
+          }
+
+          this.logger.debug(`Comment on line ${item.line} passed relevance check (score: ${relevanceScore})`);
+          return true;
         });
 
       if (validFeedback.length !== feedback.length) {
-        this.logger.warn(`Filtered out ${feedback.length - validFeedback.length} invalid feedback items`);
+        this.logger.warn(`Filtered out ${feedback.length - validFeedback.length} invalid/irrelevant feedback items`);
       }
 
       return validFeedback;
@@ -409,6 +481,95 @@ export class AIService {
       // Return empty array instead of throwing
       return [];
     }
+  }
+
+  private buildLineToCodeMap(diffChunk: string): Map<number, string> {
+    const lineToCodeMap = new Map<number, string>();
+    const lines = diffChunk.split('\n');
+
+    let currentFile = '';
+    let currentHunkStartLine = 0;
+    let inHunk = false;
+
+    this.logger.debug(`Building line-to-code map for diff chunk with ${lines.length} lines`);
+
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+
+      // Track current file
+      if (line.startsWith('diff --git')) {
+        const match = line.match(/diff --git a\/(.+) b\/(.+)/);
+        if (match) {
+          currentFile = match[1];
+          this.logger.debug(`Processing file: ${currentFile}`);
+        }
+        inHunk = false; // Reset hunk state for new file
+      }
+
+      // Parse hunk headers
+      if (line.startsWith('@@ ')) {
+        const match = line.match(/@@ -(\d+),?\d* \+(\d+),?\d* @@/);
+        if (match) {
+          currentHunkStartLine = parseInt(match[2]);
+          inHunk = true;
+          this.logger.debug(`Starting hunk at line ${currentHunkStartLine} for file ${currentFile}`);
+        }
+      }
+
+      // Map line numbers to their actual code content
+      if (inHunk && currentHunkStartLine > 0) {
+        if (line.startsWith('+')) {
+          // Addition line - this corresponds to new code in the file
+          const code = line.substring(1); // Remove + prefix
+          lineToCodeMap.set(currentHunkStartLine, code);
+          this.logger.debug(`Mapped line ${currentHunkStartLine}: ${code.trim()}`);
+          currentHunkStartLine++;
+        } else if (line.startsWith(' ')) {
+          // Context line - this corresponds to existing code in the file
+          const code = line.substring(1); // Remove space prefix
+          lineToCodeMap.set(currentHunkStartLine, code);
+          this.logger.debug(`Mapped context line ${currentHunkStartLine}: ${code.trim()}`);
+          currentHunkStartLine++;
+        } else if (line.startsWith('-')) {
+          // Deletion line - this represents code that was removed
+          // Don't increment line counter, but log it for debugging
+          const removedCode = line.substring(1);
+          this.logger.debug(`Removed line ${currentHunkStartLine}: ${removedCode.trim()}`);
+          // Note: We don't map removed lines to current line numbers
+        }
+      }
+    }
+
+    this.logger.debug(`Completed line-to-code mapping: ${lineToCodeMap.size} mappings created`);
+    return lineToCodeMap;
+  }
+
+  private extractCodeKeywords(code: string): string[] {
+    const keywords: string[] = [];
+
+    // Extract variable names, function names, etc.
+    const varMatches = code.match(/\b[a-zA-Z_$][a-zA-Z0-9_$]*\b/g);
+    if (varMatches) {
+      keywords.push(...varMatches);
+    }
+
+    // Extract string literals
+    const stringMatches = code.match(/'([^']*)'|"([^"]*)"/g);
+    if (stringMatches) {
+      keywords.push(...stringMatches.map(s => s.slice(1, -1)));
+    }
+
+    // Extract common keywords from the code
+    const codeLower = code.toLowerCase();
+    if (codeLower.includes('req.')) keywords.push('request', 'req');
+    if (codeLower.includes('res.')) keywords.push('response', 'res');
+    if (codeLower.includes('secret')) keywords.push('secret', 'webhook');
+    if (codeLower.includes('signature')) keywords.push('signature', 'crypto');
+    if (codeLower.includes('rawbody') || codeLower.includes('rawBody')) keywords.push('rawbody', 'body');
+    if (codeLower.includes('middleware')) keywords.push('middleware');
+    if (codeLower.includes('timingSafeEqual')) keywords.push('timingSafeEqual', 'crypto');
+
+    return [...new Set(keywords)]; // Remove duplicates
   }
 
   private extractDiffHunks(diffChunk: string): Array<{ header: string; content: string; startLine: number; endLine: number }> {
